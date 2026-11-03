@@ -1,4 +1,4 @@
-# mass-astudio
+# xfyun-astudio
 
 把 **AStudio（科大讯飞 Astron Studio 桌面端）** 的账号额度接入 [magpie](https://usemagpie.ai/) 与 [OpenCode](https://opencode.ai/)：复用桌面端登录态，直连云端模型网关（OpenAI Responses 协议），agent 以 `astudio/<model>` 使用它的模型；支持每日登录积分自动签到与积分余额显示。
 
@@ -52,7 +52,7 @@ AStudio 有「每日登录积分」：服务端在当天账号会话首次活跃
 ## 安装与开发
 
 ```
-magpie plugin add ./mass-astudio   # 文件夹就地加载
+magpie plugin add ./xfyun-astudio   # 文件夹就地加载
 magpie plugin login astudio                 # 选「读取 AStudio 桌面端登录态」
 magpie provider test astudio spark-x2.6-4b  # 限免模型，验收一发
 ```

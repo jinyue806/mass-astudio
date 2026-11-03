@@ -1,5 +1,5 @@
 {
-  "name": "mass-astudio",
+  "name": "xfyun-astudio",
   "version": "0.1.2",
   "description": "AStudio (iFLYTEK Astron Studio) desktop sign-in as an OpenCode/magpie provider: Responses model gateway with live model catalog",
   "type": "module",
@@ -28,6 +28,6 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/jinyue806/mass-astudio.git"
+    "url": "git+https://github.com/jinyue806/xfyun-astudio.git"
   }
 }
