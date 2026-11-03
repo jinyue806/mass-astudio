@@ -14,10 +14,12 @@
 //             points/balance、membership/me、membership/plan-config、points/summary
 //
 // 本插件复用这份登录态：第一种登录方式直接从磁盘读取桌面端会话（Raccoon
-// 「复用桌面端登录态」同款），第二种让用户手动粘贴 modelBearerToken。目录与
+// 「复用桌面端登录态」同款；magpie 的 oauth 方式，读不到时给出官网链接并轮询，
+// 等用户装好桌面端登录），第二种让用户手动粘贴 modelBearerToken。目录与
 // 思考档位按账号实时拉取（目录读取不计费）。AStudio 有「每日登录积分」
 // （服务端在当天账号会话首次活跃时发放，客户端弹窗只做通知，无领取接口），
-// auth.checkin 用「发放前后余额差」观测：涨了记 claimed，没涨记 done。
+// auth.checkin 用「发放前后余额差」观测：涨了记 claimed，没涨不谎称已签——
+// 记 inactive 并说明未观测到（宿主把 done 渲染成「今日已签到」，是没发生的断言）。
 
 import { spawnSync } from "node:child_process"
 import { readFileSync } from "node:fs"
@@ -30,16 +32,23 @@ const MODEL_GATEWAY_BASE = "https://astronstudio-api-volces-prod.xf-yun.com/mode
 const MODEL_MANAGER_URL = "https://astronstudio-api-volces-prod.xf-yun.com/api/v1/model-manager/models"
 const STUDIO_API_BASE = "https://agent.xfyun.cn/xingchen-studio/"
 
+// 读取桌面端登录态失败时展示的跳转页：AStudio 官网（含桌面端下载）。
+const OFFICIAL_SITE = "https://agent.xfyun.cn/"
+// 等待「用户去装桌面端并登录」的窗口与轮询间隔。
+const DESKTOP_POLL_MS = 2000
+const DESKTOP_WAIT_MS = 5 * 60 * 1000
+
 const REGISTRY_KEY = "HKCU\\Software\\AStudioStorage"
 const REGISTRY_PREFIXES = ["Production", "Canary", "Development"]
 
 // 未登录/拿不到桌面端数据时的兜底目录（桌面端未在注册表登记时也可能落在这些位置）。
+// 函数吃 homedir 参数（readDesktopCredential 注入，缺省回落真实家目录），测试可重定向。
 const SESSION_FALLBACKS = [
-  () => join(osHomedir(), ".acode", "acode", "userdata", "astron-session.json"),
+  (home = osHomedir()) => join(home, ".acode", "acode", "userdata", "astron-session.json"),
 ]
 
 const ACODE_CONFIG_FALLBACKS = [
-  () => join(osHomedir(), ".acode", "acode", "config.toml"),
+  (home = osHomedir()) => join(home, ".acode", "acode", "config.toml"),
 ]
 
 // 模型目录读不到时的启动表（2026-11-01 实测目录快照；models 钩子会用实时目录覆盖）。
@@ -165,8 +174,8 @@ function readDesktopCredential({ env = process.env, homedir = osHomedir(), readF
     sessionPaths.push(join(root, "userdata", "astron-session.json"))
     configPaths.push(join(root, "runtime", "acode-home", "config.toml"))
   }
-  for (const p of SESSION_FALLBACKS) sessionPaths.push(p())
-  for (const p of ACODE_CONFIG_FALLBACKS) configPaths.push(p())
+  for (const p of SESSION_FALLBACKS) sessionPaths.push(p(homedir))
+  for (const p of ACODE_CONFIG_FALLBACKS) configPaths.push(p(homedir))
 
   const problems = []
   for (const path of sessionPaths) {
@@ -183,7 +192,7 @@ function readDesktopCredential({ env = process.env, homedir = osHomedir(), readF
       problems.push(`${path} 不是有效 JSON`)
       continue
     }
-    if (session.banned === true) throw new Error(`AStudio 账号已被封禁（${path}）`)
+    if (session.banned === true) throw Object.assign(new Error(`AStudio 账号已被封禁（${path}）`), { code: "banned" })
     const key = typeof session.modelBearerToken === "string" && session.modelBearerToken.trim()
       ? session.modelBearerToken.trim()
       : typeof session.token === "string" && session.token.trim()
@@ -275,7 +284,43 @@ async function fetchCatalog(key, fetchImpl) {
   })
 }
 
-function createPlugin({ fetchImpl = globalThis.fetch, env = process.env, homedir = osHomedir(), registryQuery, readFileImpl, sleepImpl } = {}) {
+// authResult 把读到的桌面端凭据变成 magpie 的登录结果：带 key 会被存成 API key，
+// metadata 整份留给 loader / usage / checkin（session 是账号面的 Cookie 材料）。
+function authResult(cred) {
+  return {
+    type: "success",
+    key: cred.key,
+    accountId: cred.uid,
+    metadata: {
+      uid: cred.uid,
+      source: cred.source,
+      method: "desktop",
+      session: cred.session,
+    },
+  }
+}
+
+// probeDesktopCredential 读一次桌面端登录态，把「没找到」变成返回值而不是异常。
+function probeDesktopCredential(deps = {}) {
+  try {
+    return { cred: readDesktopCredential(deps) }
+  } catch (error) {
+    return { error }
+  }
+}
+
+// waitForDesktopCredential 轮询磁盘，等用户在本机装好并登录桌面端；超时返回 null。
+async function waitForDesktopCredential({ read, sleep, now, waitMs = DESKTOP_WAIT_MS, stepMs = DESKTOP_POLL_MS }) {
+  const deadline = now() + waitMs
+  for (;;) {
+    const trial = read()
+    if (trial.cred) return authResult(trial.cred)
+    if (now() >= deadline) return null
+    await sleep(stepMs)
+  }
+}
+
+function createPlugin({ fetchImpl = globalThis.fetch, env = process.env, homedir = osHomedir(), registryQuery, readFileImpl, sleepImpl, nowMsImpl = () => Date.now() } = {}) {
   const sleep = sleepImpl ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)))
 
   async function readBalance(session) {
@@ -298,26 +343,35 @@ function createPlugin({ fetchImpl = globalThis.fetch, env = process.env, homedir
       provider: ID,
       methods: [
         {
-          type: "api",
+          // oauth 方式：magpie 不显示 key 输入框，authorize 必须立刻返回
+          // { url, instructions, method, callback }，结果由 callback 交回。
+          // 读得到就立刻完成（url 留空）；读不到就给出官网链接，边等边让用户去装。
+          type: "oauth",
           label: "读取 AStudio 桌面端登录态",
-          // 不用输入框：authorize 自己从磁盘读桌面端会话。
           async authorize() {
-            let cred
-            try {
-              cred = readDesktopCredential({ env, homedir, registryQuery, readFileImpl })
-            } catch (error) {
-              return { type: "failed", error: error?.message ?? "读取 AStudio 桌面端登录态失败" }
+            const read = () => probeDesktopCredential({ env, homedir, registryQuery, readFileImpl })
+            const probe = read()
+            if (probe.cred) {
+              return {
+                url: "",
+                instructions: `已读取本机 AStudio 登录态（${probe.cred.uid}），正在完成登录…`,
+                method: "auto",
+                callback: async () => authResult(probe.cred),
+              }
+            }
+            if (probe.error?.code === "banned") {
+              return { type: "failed", error: probe.error.message }
             }
             return {
-              type: "success",
-              key: cred.key,
-              accountId: cred.uid,
-              metadata: {
-                uid: cred.uid,
-                source: cred.source,
-                method: "desktop",
-                // Cookie 会话材料：积分余额、会员信息与每日签到用。
-                session: cred.session,
+              url: OFFICIAL_SITE,
+              instructions: "本机没有找到 AStudio 桌面端登录态。装上并登录 AStudio 桌面端就好——上方链接是官网，可下载；登录后这一步会自动完成。已有 token 的话，也可以改用「粘贴 modelBearerToken」。",
+              method: "auto",
+              callback: async () => {
+                const result = await waitForDesktopCredential({ read, sleep, now: nowMsImpl })
+                return result ?? {
+                  type: "failed",
+                  error: "仍未检测到 AStudio 桌面端登录态。安装并登录 AStudio 后，重新点一次「读取 AStudio 桌面端登录态」即可。",
+                }
               },
             }
           },
@@ -325,8 +379,13 @@ function createPlugin({ fetchImpl = globalThis.fetch, env = process.env, homedir
         {
           type: "api",
           label: "粘贴 modelBearerToken",
-          placeholder: "在 astron-session.json 或 acode config.toml 里复制",
           prompts: [
+            {
+              type: "password",
+              key: "modelBearerToken",
+              message: "modelBearerToken（astron-session.json 或 acode config.toml 里的值）",
+              validate: (v) => (v && v.trim() ? undefined : "必填"),
+            },
             {
               type: "text",
               key: "uid",
@@ -335,9 +394,44 @@ function createPlugin({ fetchImpl = globalThis.fetch, env = process.env, homedir
             {
               type: "password",
               key: "sessionToken",
-              message: "网页会话 token（可选：astron-session.json 的 token 字段；用于积分余额与每日签到）",
+              message: "网页会话 token（astron-session.json 的 token 字段；用于积分余额与每日签到）",
+            },
+            {
+              type: "text",
+              key: "accountId",
+              message: "账号面 accountId（与 sessionToken 一起填，积分余额与签到才可用）",
+            },
+            {
+              type: "password",
+              key: "ssoSessionId",
+              message: "ssoSessionId（可选，Cookie 会话补充材料）",
             },
           ],
+          // 粘贴路径此前只问不存（没有 authorize，输入全部丢弃）。现在按桌面端
+          // 成功返回的同一形状落库；token+accountId 齐才组得出 Cookie 会话。
+          async authorize(inputs) {
+            const key = String(inputs?.modelBearerToken ?? "").trim()
+            if (!key) return { type: "failed", error: "modelBearerToken 必填" }
+            if (key.length > 4096) return { type: "failed", error: "凭据异常地长" }
+            const token = String(inputs?.sessionToken ?? "").trim()
+            const accountId = String(inputs?.accountId ?? "").trim()
+            const ssoSessionId = String(inputs?.ssoSessionId ?? "").trim()
+            const uid = String(inputs?.uid ?? "").trim() || undefined
+            const session = token && accountId
+              ? { token, accountId, ...(ssoSessionId ? { ssoSessionId } : {}) }
+              : undefined
+            return {
+              type: "success",
+              key,
+              accountId: accountId || uid,
+              metadata: {
+                uid,
+                source: "paste",
+                method: "paste",
+                ...(session ? { session } : {}),
+              },
+            }
+          },
         },
       ],
       // @ai-sdk/openai 把 apiKey 发成 Authorization: Bearer <key>，与桌面端内核
@@ -366,14 +460,21 @@ function createPlugin({ fetchImpl = globalThis.fetch, env = process.env, homedir
           if (!res.ok) return { error: `AStudio 返回 HTTP ${res.status}`, windows: [] }
           return { plan: "AStudio", windows: [] }
         }
+        // 单项失败不塌方（一边挂了另一边还能显示），但登录态过期必须透传，
+        // 不能折叠成「账号信息读取失败」。
+        const tolerate = (promise) =>
+          promise.catch((error) => {
+            if (error?.signIn === "expired") throw error
+            return null
+          })
         let balance, membership
         try {
           ;[balance, membership] = await Promise.all([
-            readBalance(session).catch(() => null),
-            studioJson("membership/me", { session, fetchImpl, operation: "会员信息" }).catch(() => null),
+            tolerate(readBalance(session)),
+            tolerate(studioJson("membership/me", { session, fetchImpl, operation: "会员信息" })),
           ])
         } catch (error) {
-          return { error: error?.message ?? "AStudio 账号信息读取失败", windows: [] }
+          return { error: error?.message ?? "AStudio 账号信息读取失败", signIn: "expired", windows: [] }
         }
         if (!balance && !membership) {
           return { error: "AStudio 账号信息读取失败", windows: [] }
@@ -442,7 +543,10 @@ function createPlugin({ fetchImpl = globalThis.fetch, env = process.env, homedir
         }
         const delta = after.totalBalance - before.totalBalance
         if (delta > 0) return { outcome: "claimed", credit: delta, message: `每日登录积分 +${delta}` }
-        return { outcome: "done", message: "今日未观测到新发放（可能已发放，或发放挂靠桌面端登录）" }
+        // 余额没涨 ≠ 已发放：无领取接口，发放可能挂靠桌面端登录，本次未观测到。
+        // 不能报 done（宿主渲染成「今日已签到」，是没发生的断言）；inactive 是
+        // 静默结算态，message 仍会把实情带给用户。
+        return { outcome: "inactive", message: "未观测到新发放：余额无变化（发放可能挂靠桌面端登录）" }
       },
     },
 
@@ -492,6 +596,9 @@ export const _internal = {
   rowFromCatalogEntry,
   bootstrapRows,
   readDesktopCredential,
+  probeDesktopCredential,
+  waitForDesktopCredential,
+  authResult,
   readAcodeConfigToken,
   registryDataRoots,
   buildCookieHeader,
@@ -499,6 +606,8 @@ export const _internal = {
   MODEL_GATEWAY_BASE,
   MODEL_MANAGER_URL,
   STUDIO_API_BASE,
+  OFFICIAL_SITE,
+  DESKTOP_WAIT_MS,
   BOOTSTRAP,
   ID,
 }
