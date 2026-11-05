@@ -17,9 +17,12 @@
 // 「复用桌面端登录态」同款；magpie 的 oauth 方式，读不到时给出官网链接并轮询，
 // 等用户装好桌面端登录），第二种让用户手动粘贴 modelBearerToken。目录与
 // 思考档位按账号实时拉取（目录读取不计费）。AStudio 有「每日登录积分」
-// （服务端在当天账号会话首次活跃时发放，客户端弹窗只做通知，无领取接口），
-// auth.checkin 用「发放前后余额差」观测：涨了记 claimed，没涨不谎称已签——
-// 记 inactive 并说明未观测到（宿主把 done 渲染成「今日已签到」，是没发生的断言）。
+// （服务端在当天账号会话首次活跃时发放，客户端弹窗只做通知，无领取接口）。
+// 实测只发账号面 GET 不会生成当日的 DAILY_REWARD_DIALOG 待通知弹窗（桌面端启动
+// 后才有），发放挂靠桌面端启动时的 POST：tenant-app/v2/init-app（另一个
+// auth/bearer-token 会换发模型凭据，安全性未证，签到不复刻）。auth.checkin 先
+// 发 init-app 再观测：余额涨了记 claimed，没涨但出现新的当日弹窗记 done，都没有
+// 才记 inactive（宿主把 done 渲染成「今日已签到」，没发生的不能断言）。
 
 import { spawnSync } from "node:child_process"
 import { readFileSync } from "node:fs"
@@ -354,6 +357,26 @@ function createPlugin({ fetchImpl = globalThis.fetch, env = process.env, homedir
     return await studioJson("points/balance", { session, fetchImpl, operation: "积分余额" })
   }
 
+  async function readPopups(session) {
+    return await studioJson("client-popups/pending", { session, fetchImpl, operation: "每日奖励弹窗" })
+  }
+
+  // 桌面端启动时的两个 POST 里，签到只复刻 init-app（租户初始化）。另一个
+  // auth/bearer-token 会换发 modelBearerToken，而「新旧 token 并存、旧 token
+  // 不被作废」尚未实证；自动签到里换发可能把用户手上的 key 打掉，故不调用。
+  // 失败不塌方，但原因要收集起来交给上层，否则用户分不清「POST 失败」和
+  // 「今天确实没发」。
+  async function desktopLogin(session) {
+    const warnings = []
+    try {
+      await studioJson("tenant-app/v2/init-app", { session, fetchImpl, method: "POST", operation: "租户初始化" })
+    } catch (error) {
+      if (error?.signIn === "expired") throw error
+      warnings.push(`init-app ${error?.message ?? "失败"}`)
+    }
+    return { warnings }
+  }
+
   return {
     config: async (cfg) => {
       cfg.provider ??= {}
@@ -533,8 +556,8 @@ function createPlugin({ fetchImpl = globalThis.fetch, env = process.env, homedir
         }
       },
       // 「每日登录积分」：服务端在当天账号会话首次活跃时发放，客户端没有领取
-      // 接口（DAILY_REWARD_DIALOG 弹窗只做通知）。这里以一组账号面请求代表
-      // 当天的会话活跃，再用余额差与待通知弹窗观测结果，不谎称已领取。
+      // 接口（DAILY_REWARD_DIALOG 弹窗只做通知）。只发账号面 GET 不会触发发放，
+      // 这里先复刻桌面端启动的 init-app，再用余额差与新增的当日弹窗观测结果。
       async checkin(getAuth) {
         const auth = await getAuth()
         if (auth?.type !== "api" || !auth.key) return {}
@@ -559,6 +582,19 @@ function createPlugin({ fetchImpl = globalThis.fetch, env = process.env, homedir
           if (error?.signIn === "expired") throw error
           return { outcome: "failed", message: error?.message ?? "积分余额读取失败" }
         }
+        // 基线弹窗：签到前就挂着的旧弹窗不能算今天的发放。读失败记为「未知」
+        // （null），与「确认没有」区分开——未知时既不能判 done，也不能消费弹窗。
+        let hadDailyBefore = null
+        let baselineError = null
+        try {
+          const baseline = await readPopups(session)
+          hadDailyBefore = Array.isArray(baseline) && baseline.some((item) => item?.componentType === "DAILY_REWARD_DIALOG")
+        } catch (error) {
+          if (error?.signIn === "expired") throw error
+          baselineError = error
+        }
+        const login = await desktopLogin(session)
+        const warnings = login.warnings
         // 会话活跃 touch：与桌面端启动时同类只读请求。
         await studioJson("membership/me", { session, fetchImpl, operation: "会员信息" }).catch(() => null)
         await studioJson("points/summary", { session, fetchImpl, operation: "积分汇总" }).catch(() => null)
@@ -574,24 +610,58 @@ function createPlugin({ fetchImpl = globalThis.fetch, env = process.env, homedir
           return { outcome: "failed", message: "积分余额读数不完整" }
         }
         const delta = after.totalBalance - before.totalBalance
-        if (delta > 0) return { outcome: "claimed", credit: delta, message: `每日登录积分 +${delta}` }
         // 服务端把已发放但还没通知的每日奖励挂成待通知弹窗；见到它才算「今日已签到」。
-        let popups
+        // claimed 分支同样要读：弹窗不确认会一直堆在待通知列表里。
+        let popups = null
+        let popupError = null
         try {
-          popups = await studioJson("client-popups/pending", { session, fetchImpl, operation: "每日奖励弹窗" })
+          popups = await readPopups(session)
         } catch (error) {
           if (error?.signIn === "expired") throw error
-          return { outcome: "failed", message: error?.message ?? "每日奖励弹窗读取失败" }
+          popupError = error
+        }
+        // 桌面端点「知道了」就是 complete（只做确认，实测不发放、不影响余额）。
+        // 基线未知时不消费：否则可能把今天之前就挂着的弹窗替用户点掉。
+        const confirmDaily = async () => {
+          if (hadDailyBefore === null) return
+          const daily = Array.isArray(popups) && popups.find((item) => item?.componentType === "DAILY_REWARD_DIALOG")
+          if (!daily) return
+          await studioJson("client-popups/complete", {
+            session,
+            fetchImpl,
+            method: "POST",
+            body: { popupId: daily.popupId, instanceKey: daily.instanceKey, completed: true },
+            operation: "每日奖励确认",
+          }).catch(() => null)
+        }
+        const warnSuffix = warnings.length ? `（${warnings.join(" / ")}）` : ""
+        if (delta > 0) {
+          await confirmDaily()
+          return { outcome: "claimed", credit: delta, message: `每日登录积分 +${delta}` }
+        }
+        // 基线读失败 ⇒ 不知道签到前是否已有弹窗，任何 done 结论都是猜的。
+        if (hadDailyBefore === null) {
+          return {
+            outcome: "failed",
+            message: `签到前无法读取每日奖励弹窗，不能判定今日是否发放${baselineError?.message ? `：${baselineError.message}` : ""}${warnSuffix}`,
+          }
+        }
+        if (popupError) {
+          return { outcome: "failed", message: `${popupError?.message ?? "每日奖励弹窗读取失败"}${warnSuffix}` }
         }
         const daily = Array.isArray(popups) && popups.find((item) => item?.componentType === "DAILY_REWARD_DIALOG")
         if (daily) {
+          await confirmDaily()
           const rawPoints = Number(daily.payload?.points)
           const credit = Number.isFinite(rawPoints) && rawPoints >= 0 ? rawPoints : 0
+          // payload 没有日期字段，签到前就挂着的那份无法断定是今天的。
+          if (hadDailyBefore === true) {
+            return { outcome: "inactive", message: "余额无变化，且签到前已有未确认的每日奖励弹窗，无法判定今日是否发放" }
+          }
           return { outcome: "done", ...(credit > 0 ? { credit } : {}), message: "每日登录积分已发放（服务端待通知弹窗）" }
         }
-        // 余额没涨、也没有待通知弹窗：发放可能挂靠桌面端登录，本次未观测到。
-        // done 会渲染成「今日已签到」，是没发生的断言，故记 inactive。
-        return { outcome: "inactive", message: "未观测到新发放：余额无变化（发放可能挂靠桌面端登录）" }
+        // 余额没涨、也没有待通知弹窗：这套请求序列没触发发放，不谎称已签。
+        return { outcome: "inactive", message: `未观测到新发放：余额无变化，也没有今日的每日奖励弹窗${warnSuffix}` }
       },
     },
 
