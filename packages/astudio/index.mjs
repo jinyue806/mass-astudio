@@ -17,9 +17,14 @@
 // 「复用桌面端登录态」同款；magpie 的 oauth 方式，读不到时给出官网链接并轮询，
 // 等用户装好桌面端登录），第二种让用户手动粘贴 modelBearerToken。目录与
 // 思考档位按账号实时拉取（目录读取不计费）。AStudio 有「每日登录积分」
-// （服务端在当天账号会话首次活跃时发放，客户端弹窗只做通知，无领取接口），
-// auth.checkin 用「发放前后余额差」观测：涨了记 claimed，没涨不谎称已签——
-// 记 inactive 并说明未观测到（宿主把 done 渲染成「今日已签到」，是没发生的断言）。
+// （服务端在当天账号会话首次活跃时发放，客户端弹窗只做通知，无领取接口）。
+// 实测只发账号面 GET 不会生成当日的 DAILY_REWARD_DIALOG 待通知弹窗（桌面端启动
+// 后才有），发放挂靠桌面端启动时的 POST：tenant-app/v2/init-app（另一个
+// auth/bearer-token 会换发模型凭据，安全性未证，签到不复刻）。auth.checkin 发
+// init-app 后读当日获得流水（points/details direction=CREDIT，网页后台同源
+// 权威数据）：有「每日登录赠送」GRANT 行即发放完成（先于签到发生的记 done，
+// 余额差为正记 claimed）；流水读失败退回旧的余额差+弹窗判据；流水通畅但无
+// GRANT 行才记 inactive（宿主把 done 渲染成「今日已签到」，没发生的不能断言）。
 
 import { spawnSync } from "node:child_process"
 import { readFileSync } from "node:fs"
@@ -354,6 +359,76 @@ function createPlugin({ fetchImpl = globalThis.fetch, env = process.env, homedir
     return await studioJson("points/balance", { session, fetchImpl, operation: "积分余额" })
   }
 
+  // points/details 的时间参数格式（网页端同款）：`YYYY-MM-DD HH:mm:ss`。
+  function stamp(d) {
+    const p2 = (n) => String(n).padStart(2, "0")
+    return `${d.getFullYear()}-${p2(d.getMonth() + 1)}-${p2(d.getDate())} ${p2(d.getHours())}:${p2(d.getMinutes())}:${p2(d.getSeconds())}`
+  }
+
+  function todayStart() {
+    const d = new Date()
+    d.setHours(0, 0, 0, 0)
+    return stamp(d)
+  }
+
+  // 当日「每日登录赠送」入账流水。网页后台的获得明细（points/details
+  // direction=CREDIT）是权威数据源：发放一旦发生就有 GRANT 行，不管由哪个
+  // 端触发（桌面端 init-app、服务端午夜批量），都比「余额差+弹窗」可靠。
+  async function readDailyGrantLedger(session) {
+    const query = `pageNum=1&pageSize=50&direction=CREDIT&startTime=${encodeURIComponent(todayStart())}&endTime=${encodeURIComponent(stamp(new Date()))}`
+    const data = await studioJson(`points/details?${query}`, { session, fetchImpl, operation: "获得明细" })
+    const items = Array.isArray(data?.items) ? data.items : []
+    return items.find((item) => item?.direction === "CREDIT" && item?.operation === "GRANT" && item?.reason === "每日登录赠送") ?? null
+  }
+
+  // 星火积分最近到期批次（raccoon 同款算法）：流水按 expireTime 聚合，
+  // 取最近的未过期批次金额，供 usage 窗口挂 runsOutAt/runsOut。
+  // 服务端时间戳是北京时间的裸串（无时区标记），显式钉 +08:00：
+  // 不同运行时对无时区 ISO 串的解释不同（node=本地时区、bun=UTC）。
+  const parseCST = (s) => Date.parse(/(?:[zZ]|[+-]\d{2}:?\d{2})$/.test(s) ? s : `${s}+08:00`)
+  async function readSparkExpiry(session) {
+    const start = new Date(Date.now() - 60 * 86400000)
+    const query = `pageNum=1&pageSize=50&direction=CREDIT&startTime=${encodeURIComponent(stamp(start))}&endTime=${encodeURIComponent(stamp(new Date()))}`
+    const data = await studioJson(`points/details?${query}`, { session, fetchImpl, operation: "获得明细" })
+    const now = Date.now()
+    let soonestMs = 0
+    let expiring = 0
+    for (const item of Array.isArray(data?.items) ? data.items : []) {
+      if (item?.assetCode !== "SPARK_POINTS") continue
+      const amount = Number(item?.amount)
+      const expMs = item?.expireTime ? parseCST(item.expireTime) : NaN
+      if (!Number.isFinite(amount) || amount <= 0) continue
+      if (!Number.isFinite(expMs) || expMs <= now) continue
+      if (!soonestMs || expMs < soonestMs) {
+        soonestMs = expMs
+        expiring = amount
+      } else if (expMs === soonestMs) {
+        expiring += amount
+      }
+    }
+    return soonestMs ? { runsOutAt: new Date(soonestMs).toISOString(), runsOut: expiring } : null
+  }
+
+  async function readPopups(session) {
+    return await studioJson("client-popups/pending", { session, fetchImpl, operation: "每日奖励弹窗" })
+  }
+
+  // 桌面端启动时的两个 POST 里，签到只复刻 init-app（租户初始化）。另一个
+  // auth/bearer-token 会换发 modelBearerToken，而「新旧 token 并存、旧 token
+  // 不被作废」尚未实证；自动签到里换发可能把用户手上的 key 打掉，故不调用。
+  // 失败不塌方，但原因要收集起来交给上层，否则用户分不清「POST 失败」和
+  // 「今天确实没发」。
+  async function desktopLogin(session) {
+    const warnings = []
+    try {
+      await studioJson("tenant-app/v2/init-app", { session, fetchImpl, method: "POST", operation: "租户初始化" })
+    } catch (error) {
+      if (error?.signIn === "expired") throw error
+      warnings.push(`init-app ${error?.message ?? "失败"}`)
+    }
+    return { warnings }
+  }
+
   return {
     config: async (cfg) => {
       cfg.provider ??= {}
@@ -523,7 +598,14 @@ function createPlugin({ fetchImpl = globalThis.fetch, env = process.env, homedir
           })
         }
         if (balance && typeof balance.sparkTotalBalance === "number") {
-          windows.push({ name: "星火积分", balance: balance.sparkTotalBalance, aside: false })
+          // 星火积分的到期时间 balance 接口不给，从入账流水推（失败不塌方）。
+          const sparkExpiry = await readSparkExpiry(session).catch(() => null)
+          windows.push({
+            name: "星火积分",
+            balance: balance.sparkTotalBalance,
+            aside: false,
+            ...(sparkExpiry && balance.sparkTotalBalance > 0 ? sparkExpiry : {}),
+          })
         }
         return {
           ...(membership?.planName ? { plan: membership.planName } : { plan: "AStudio" }),
@@ -533,8 +615,8 @@ function createPlugin({ fetchImpl = globalThis.fetch, env = process.env, homedir
         }
       },
       // 「每日登录积分」：服务端在当天账号会话首次活跃时发放，客户端没有领取
-      // 接口（DAILY_REWARD_DIALOG 弹窗只做通知）。这里以一组账号面请求代表
-      // 当天的会话活跃，再用余额差与待通知弹窗观测结果，不谎称已领取。
+      // 接口（DAILY_REWARD_DIALOG 弹窗只做通知）。只发账号面 GET 不会触发发放，
+      // 这里先复刻桌面端启动的 init-app，再用余额差与新增的当日弹窗观测结果。
       async checkin(getAuth) {
         const auth = await getAuth()
         if (auth?.type !== "api" || !auth.key) return {}
@@ -559,10 +641,91 @@ function createPlugin({ fetchImpl = globalThis.fetch, env = process.env, homedir
           if (error?.signIn === "expired") throw error
           return { outcome: "failed", message: error?.message ?? "积分余额读取失败" }
         }
+        // 基线弹窗：签到前就挂着的旧弹窗不能算今天的发放。读失败记为「未知」
+        // （null），与「确认没有」区分开——未知时既不能判 done，也不能消费弹窗。
+        let hadDailyBefore = null
+        let baselineError = null
+        try {
+          const baseline = await readPopups(session)
+          hadDailyBefore = Array.isArray(baseline) && baseline.some((item) => item?.componentType === "DAILY_REWARD_DIALOG")
+        } catch (error) {
+          if (error?.signIn === "expired") throw error
+          baselineError = error
+        }
+        const login = await desktopLogin(session)
+        const warnings = login.warnings
         // 会话活跃 touch：与桌面端启动时同类只读请求。
         await studioJson("membership/me", { session, fetchImpl, operation: "会员信息" }).catch(() => null)
         await studioJson("points/summary", { session, fetchImpl, operation: "积分汇总" }).catch(() => null)
         await sleep(2500)
+        // 权威判据：当日获得流水里有「每日登录赠送」GRANT 行即发放完成——
+        // 不管是本次 init-app 触发，还是桌面端/服务端先发的（11-06 实测午夜
+        // 批量先于签到，纯余额差观测会误报 inactive）。流水读失败才退回
+        // 旧判据（余额差+弹窗）。
+        let grant = null
+        let ledgerError = null
+        try {
+          grant = await readDailyGrantLedger(session)
+        } catch (error) {
+          if (error?.signIn === "expired") throw error
+          ledgerError = error
+        }
+        // 桌面端点「知道了」就是 complete（只做确认，实测不发放、不影响余额）。
+        // 基线未知时不消费：否则可能把今天之前就挂着的弹窗替用户点掉。
+        const confirmDaily = async () => {
+          if (hadDailyBefore === null) return
+          let popups = null
+          try {
+            popups = await readPopups(session)
+          } catch {
+            return
+          }
+          const daily = Array.isArray(popups) && popups.find((item) => item?.componentType === "DAILY_REWARD_DIALOG")
+          if (!daily) return
+          await studioJson("client-popups/complete", {
+            session,
+            fetchImpl,
+            method: "POST",
+            body: { popupId: daily.popupId, instanceKey: daily.instanceKey, completed: true },
+            operation: "每日奖励确认",
+          }).catch(() => null)
+        }
+        if (grant) {
+          const rawPoints = Number(grant.amount)
+          const credit = Number.isFinite(rawPoints) && rawPoints > 0 ? rawPoints : 0
+          // 本次触发的证据：签到前后余额差为正（发放发生在 init-app 之后）。
+          // 余额读数缺失时不硬归因，按「先于签到发生」处理。
+          let after = null
+          try {
+            after = await readBalance(session)
+          } catch { /* 余额读不到不影响 done/claimed 以外的结论 */ }
+          const triggeredByCheckin =
+            typeof before?.totalBalance === "number" &&
+            typeof after?.totalBalance === "number" &&
+            after.totalBalance > before.totalBalance
+          await confirmDaily()
+          // 顺带读一次星火到期批次：7 天内有大额到期就在签到消息里提醒。
+          const sparkExpiry = await readSparkExpiry(session).catch(() => null)
+          const daysLeft = sparkExpiry ? Math.floor((Date.parse(sparkExpiry.runsOutAt) - Date.now()) / 86400000) : Infinity
+          const expiryNote = sparkExpiry && daysLeft <= 7 ? `；注意 ${sparkExpiry.runsOut} 星火积分 ${daysLeft === 0 ? "今天" : `${daysLeft} 天内`}到期` : ""
+          if (triggeredByCheckin) {
+            return {
+              outcome: "claimed",
+              ...(credit > 0 ? { credit } : {}),
+              message: `每日登录积分 +${credit || "?"}（流水实证，本次签到触发）${expiryNote}`,
+            }
+          }
+          return {
+            outcome: "done",
+            ...(credit > 0 ? { credit } : {}),
+            message: `每日登录积分 +${credit || 0} 已发放（流水实证，先于签到发生）${expiryNote}`,
+          }
+        }
+        if (!ledgerError) {
+          // 流水通畅且无当日 GRANT 行：确实没发放。不谎称已签。
+          return { outcome: "inactive", message: `未观测到新发放：当日获得流水无「每日登录赠送」记录${warnings.length ? `（${warnings.join(" / ")}）` : ""}` }
+        }
+        // ---- 流水读失败：退回旧判据（余额差+弹窗）----
         let after
         try {
           after = await readBalance(session)
@@ -574,24 +737,42 @@ function createPlugin({ fetchImpl = globalThis.fetch, env = process.env, homedir
           return { outcome: "failed", message: "积分余额读数不完整" }
         }
         const delta = after.totalBalance - before.totalBalance
-        if (delta > 0) return { outcome: "claimed", credit: delta, message: `每日登录积分 +${delta}` }
-        // 服务端把已发放但还没通知的每日奖励挂成待通知弹窗；见到它才算「今日已签到」。
-        let popups
+        let popups = null
+        let popupError = null
         try {
-          popups = await studioJson("client-popups/pending", { session, fetchImpl, operation: "每日奖励弹窗" })
+          popups = await readPopups(session)
         } catch (error) {
           if (error?.signIn === "expired") throw error
-          return { outcome: "failed", message: error?.message ?? "每日奖励弹窗读取失败" }
+          popupError = error
+        }
+        const warnSuffix = warnings.length ? `（${warnings.join(" / ")}）` : ""
+        if (delta > 0) {
+          await confirmDaily()
+          return { outcome: "claimed", credit: delta, message: `每日登录积分 +${delta}` }
+        }
+        // 基线读失败 ⇒ 不知道签到前是否已有弹窗，任何 done 结论都是猜的。
+        if (hadDailyBefore === null) {
+          return {
+            outcome: "failed",
+            message: `签到前无法读取每日奖励弹窗，不能判定今日是否发放${baselineError?.message ? `：${baselineError.message}` : ""}${warnSuffix}`,
+          }
+        }
+        if (popupError) {
+          return { outcome: "failed", message: `${popupError?.message ?? "每日奖励弹窗读取失败"}${warnSuffix}` }
         }
         const daily = Array.isArray(popups) && popups.find((item) => item?.componentType === "DAILY_REWARD_DIALOG")
         if (daily) {
+          await confirmDaily()
           const rawPoints = Number(daily.payload?.points)
           const credit = Number.isFinite(rawPoints) && rawPoints >= 0 ? rawPoints : 0
+          // payload 没有日期字段，签到前就挂着的那份无法断定是今天的。
+          if (hadDailyBefore === true) {
+            return { outcome: "inactive", message: "余额无变化，且签到前已有未确认的每日奖励弹窗，无法判定今日是否发放" }
+          }
           return { outcome: "done", ...(credit > 0 ? { credit } : {}), message: "每日登录积分已发放（服务端待通知弹窗）" }
         }
-        // 余额没涨、也没有待通知弹窗：发放可能挂靠桌面端登录，本次未观测到。
-        // done 会渲染成「今日已签到」，是没发生的断言，故记 inactive。
-        return { outcome: "inactive", message: "未观测到新发放：余额无变化（发放可能挂靠桌面端登录）" }
+        // 余额没涨、也没有待通知弹窗：这套请求序列没触发发放，不谎称已签。
+        return { outcome: "inactive", message: `未观测到新发放：余额无变化，也没有今日的每日奖励弹窗${warnSuffix}` }
       },
     },
 
